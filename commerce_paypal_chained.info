@@ -1,0 +1,5 @@
+name = Commerce Paypal chained payments
+description = Implements PayPal Website Payments Standard in Drupal Commerce checkout.
+package = Commerce (PayPal)
+dependencies[] = commerce_paypal
+core = 7.x

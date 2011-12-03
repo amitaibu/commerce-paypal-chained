@@ -1,0 +1,204 @@
+<?php
+
+/**
+ * @file
+ * Implements PayPal Website Payments Standard in Drupal Commerce checkout.
+ */
+
+/**
+ * Implements hook_commerce_payment_method_info().
+ */
+function comemrce_paypal_chained_commerce_payment_method_info() {
+  $payment_methods = array();
+
+  $payment_methods['comemrce_paypal_chained'] = array(
+    'base' => 'comemrce_paypal_chained',
+    'title' => t('PayPal chained for Commerce'),
+    'short_title' => t('PayPal comemrce'),
+    'description' => t('PayPal chained for comemrce'),
+    'terminal' => FALSE,
+    'offsite' => TRUE,
+    'offsite_autoredirect' => FALSE,
+    'callbacks' => array(
+      'settings_form' => 'commerce_paypal_wps_settings_form',
+      'redirect_form_validate' => 'commerce_paypal_wps_redirect_form_validate',
+    ),
+  );
+
+  return $payment_methods;
+}
+
+/**
+ * Payment method callback: redirect form, a wrapper around the module's general
+ * use function.
+ */
+function comemrce_paypal_chained_redirect_form($form, &$form_state, $order, $payment_method) {
+  // Return an error if the enabling action's settings haven't been configured.
+  if (empty($payment_method['settings']['business'])) {
+    drupal_set_message(t('PayPal is not configured for use. No PayPal e-mail address has been specified.'), 'error');
+    return array();
+  }
+
+  $settings = array(
+    // Return to the previous page when payment is canceled
+    'cancel_return' => url('checkout/' . $order->order_id . '/payment/back/' . $order->data['payment_redirect_key'], array('absolute' => TRUE)),
+
+    // Return to the payment redirect page for processing successful payments
+    'return' => url('checkout/' . $order->order_id . '/payment/return/' . $order->data['payment_redirect_key'], array('absolute' => TRUE)),
+
+    // Specify the current payment method instance ID in the notify_url
+    'payment_method' => $payment_method['instance_id'],
+  );
+
+  return comemrce_paypal_chained_order_form($form, $form_state, $order, $payment_method['settings'] + $settings);
+}
+
+/**
+ * Payment method callback: validate an IPN based on receiver e-mail address,
+ * price, and other parameters as possible.
+ */
+function comemrce_paypal_chained_paypal_ipn_validate($order, $payment_method, $ipn) {
+  commerce_paypal_wps_paypal_ipn_validate($order, $payment_method, $ipn);
+}
+
+/**
+ * Payment method callback: process an IPN once it's been validated.
+ */
+function comemrce_paypal_chained_paypal_ipn_process($order, $payment_method, &$ipn) {
+  commerce_paypal_wps_paypal_ipn_process($order, $payment_method, $ipn);
+}
+
+/**
+ * Builds a Website Payments Standard form from an order object.
+ *
+ * @param $order
+ *   The fully loaded order being paid for.
+ * @param $settings
+ *   An array of settings used to build out the form, including:
+ *   - server: which server to use, either sandbox or live
+ *   - business: the PayPal e-mail address the payment submits to
+ *   - cancel_return: the URL PayPal should send the user to on cancellation
+ *   - return: the URL PayPal should send the user to on successful payment
+ *   - currency_code: the PayPal currency code to use for this payment if the
+ *     total for the order is in a non-PayPal supported currency
+ *   - language: the PayPal language code to use on the payment form
+ *   - payment_action: the PayPal payment action to use: sale, authorization,
+ *     or order
+ *   - payment_method: optionally the name of the Commerce payment method to
+ *     include in the IPN notify_url
+ *
+ * @return
+ *   A renderable form array.
+ */
+function comemrce_paypal_chained_order_form($form, &$form_state, $order, $settings) {
+  require_once libraries_get_path('paypal') . '/CallerService.php';
+  require_once "Constants.php";
+
+  global $user;
+  $logged_in_user = clone $user;
+  $logged_in_user = user_load($logged_in_user->uid);
+  $wrapper = entity_metadata_wrapper('commerce_order', $order);
+
+  $currency_code = $wrapper->commerce_order_total->currency_code->value();
+  $amount = $wrapper->commerce_order_total->amount->value();
+
+  // Ensure a default value for the payment_method setting.
+  $settings += array('payment_method' => '');
+
+  $product_sku = $wrapper->commerce_line_items->get(0)->commerce_product->sku->value();
+  $product_wrapper =  entity_metadata_wrapper('node', $product_sku);
+
+  // Return if no Paypal field in user.
+  $account = $product_wrapper->author->value();
+  if (empty($account->field_paypal_email)) {
+    watchdog('comemrce_paypal_chained', 'No paypal in seller.');
+    drupal_set_message(t('User @name has no Paypal account defined.', array('@name' => format_username($account))), 'error');
+    drupal_goto();
+  }
+  // Full price.
+  $full_price = round(commerce_currency_amount_to_decimal($amount, $currency_code), 2);
+  // Calculate price to end user.
+  // TODO: Remove hardcoding.
+  $end_price = round($full_price * 0.95);
+
+  $serverName = $_SERVER['SERVER_NAME'];
+	$serverPort = $_SERVER['SERVER_PORT'];
+	$senderEmail = $product_wrapper->author->field_paypal_email->value();
+
+	$request_array= array(
+	  Pay::$actionType => 'PAY',
+	  Pay::$cancelUrl  => $settings['cancel_return'],
+	  Pay::$returnUrl => $settings['return'],
+	  Pay::$currencyCode  => in_array($currency_code, array_keys(commerce_paypal_wps_currencies())) ? $currency_code : $settings['currency_code'],
+
+	  Pay::$clientDetails_deviceId  => DEVICE_ID,
+	  Pay::$clientDetails_ipAddress  => '127.0.0.1',
+	  Pay::$clientDetails_applicationId => APPLICATION_ID,
+	  RequestEnvelope::$requestEnvelopeErrorLanguage => 'en_US',
+	  Pay::$feesPayer => 'EACHRECEIVER'
+	);
+
+	$receiverEmail = array($settings['business'] , $product_wrapper->author->field_paypal_email->value());
+
+	$receiverAmount = array($full_price, $end_price);
+	$primaryReceiver = array('true', 'false');
+
+  if (isset($receiverEmail)) {
+		$i = 0;
+		$j = 0;
+		$k = 0;
+		foreach ($receiverEmail as $value) {
+			$request_array[Pay::$receiverEmail[$i]] = $value;
+			$i++;
+		}
+		foreach ($receiverAmount as $value) {
+			$request_array[Pay::$receiverAmount[$j]] = $value;
+			$j++;
+		}
+		foreach ($primaryReceiver as $value) {
+			$request_array[Pay::$primaryReceiver[$k]] = $value;
+			$k++;
+		}
+	}
+
+	if (!empty($senderEmail) && ($senderEmail != $product_wrapper->author->field_paypal_email->value())) {
+		$request_array[Pay::$senderEmail]  = $senderEmail;
+	}
+
+  $nvpStr = http_build_query($request_array, '', '&');
+  $resArray = hash_call('AdaptivePayments/Pay', $nvpStr);
+
+  if ($resArray['responseEnvelope.ack'] != 'Success') {
+    watchdog('comemrce_paypal_chained', 'ERROR with paypal.');
+    drupal_set_message(t('There was an error with Paypal'), 'error');
+    drupal_goto();
+  }
+
+  // Preapre the link with the token we got back from Paypal.
+	$payPalURL = comemrce_paypal_wps_server_url($settings['server']) . '_ap-payment&paykey=' . $resArray['payKey'];
+
+	$form['submit_link'] = array(
+    '#type' => 'link',
+    '#href' => $payPalURL,
+	  '#title' => t('Click here to continue to Paypal'),
+  );
+	return $form;
+}
+
+/**
+ * Returns the URL to the specified PayPal WPS server.
+ *
+ * @param $server
+ *   Either sandbox or live indicating which server to get the URL for.
+ *
+ * @return
+ *   The URL to use to submit requests to the PayPal WPS server.
+ */
+function comemrce_paypal_wps_server_url($server) {
+  switch ($server) {
+    case 'sandbox':
+      return 'https://www.sandbox.paypal.com/webscr&cmd=';
+    case 'live':
+      return 'https://www.paypal.com/cgi-bin/webscr';
+  }
+}
